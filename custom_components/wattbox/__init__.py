@@ -108,8 +108,16 @@ async def _async_create_wattbox(
         wattbox = await async_create_http_wattbox(
             host=host, user=username, password=password, port=port
         )
+        _set_http_control_headers(wattbox)
 
     return wattbox
+
+
+def _set_http_control_headers(wattbox: BaseWattBox) -> None:
+    """Set headers required by some WattBox HTTP control endpoints."""
+    async_client = getattr(wattbox, "async_client", None)
+    if async_client is not None:
+        async_client.headers.update({"User-Agent": "APP"})
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:

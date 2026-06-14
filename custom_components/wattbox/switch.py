@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from pywattbox.base import BaseWattBox, Outlet
+from pywattbox.base import BaseWattBox, Commands, Outlet
 
 from .const import CONF_NAME_REGEXP, CONF_SKIP_REGEXP, DOMAIN_DATA, PLUG_ICON
 from .entity import WattBoxEntity
@@ -224,4 +224,7 @@ class WattBoxMasterSwitch(WattBoxBinarySwitch):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the switch."""
         if self._outlet is not None:
-            await super().async_turn_on(**kwargs)
+            if hasattr(self._wattbox, "async_send_master_command"):
+                await self._wattbox.async_send_master_command(Commands.OFF)
+            else:
+                await super().async_turn_off(**kwargs)
