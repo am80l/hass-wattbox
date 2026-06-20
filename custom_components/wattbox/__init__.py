@@ -117,7 +117,7 @@ def _set_http_control_headers(wattbox: BaseWattBox) -> None:
     """Set headers required by some WattBox HTTP control endpoints."""
     async_client = getattr(wattbox, "async_client", None)
     if async_client is not None:
-        async_client.headers.update({"User-Agent": "APP"})
+        async_client.headers.update({"Connection": "keep-alive", "User-Agent": "HA"})
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:

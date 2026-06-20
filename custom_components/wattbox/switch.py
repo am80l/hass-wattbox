@@ -2,6 +2,7 @@
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
@@ -11,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from httpx import HTTPStatusError
 from pywattbox.base import BaseWattBox, Commands, Outlet
 
 from .const import CONF_NAME_REGEXP, CONF_SKIP_REGEXP, DOMAIN_DATA, PLUG_ICON
@@ -180,11 +182,7 @@ class WattBoxBinarySwitch(WattBoxEntity, SwitchEntity):
         _LOGGER.debug(
             "Current Outlet Before: %s - %s", self._outlet.status, repr(self._outlet)
         )
-        # Update state first so it is not stale.
-        self._attr_is_on = True
-        self.async_write_ha_state()
-        # Trigger the action on the wattbox.
-        await self._outlet.async_turn_on()
+        await self._async_run_outlet_command(True, self._outlet.async_turn_on)
 
     async def async_turn_off(self, **_kwargs: Any) -> None:
         """Turn off the switch."""
@@ -192,11 +190,36 @@ class WattBoxBinarySwitch(WattBoxEntity, SwitchEntity):
         _LOGGER.debug(
             "Current Outlet Before: %s - %s", self._outlet.status, repr(self._outlet)
         )
-        # Update state first so it is not stale.
-        self._attr_is_on = False
+        await self._async_run_outlet_command(False, self._outlet.async_turn_off)
+
+    async def _async_run_outlet_command(
+        self, desired_state: bool, command: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Run an outlet command and verify state from the WattBox afterward."""
+        try:
+            await command()
+        except HTTPStatusError as err:
+            if err.response.status_code != 400:
+                raise
+
+            await self._async_refresh_from_wattbox()
+            if self._outlet.status is desired_state:
+                _LOGGER.warning(
+                    "WattBox returned HTTP 400 for %s, but outlet %s reached %s",
+                    self._wattbox,
+                    self._outlet.index,
+                    desired_state,
+                )
+                return
+            raise
+
+        await self._async_refresh_from_wattbox()
+
+    async def _async_refresh_from_wattbox(self) -> None:
+        """Refresh WattBox data and publish the current outlet state."""
+        await self._wattbox.async_update()
+        await self.async_update()
         self.async_write_ha_state()
-        # Trigger the action on the wattbox.
-        await self._outlet.async_turn_off()
 
 
 class WattBoxMasterSwitch(WattBoxBinarySwitch):
@@ -224,7 +247,12 @@ class WattBoxMasterSwitch(WattBoxBinarySwitch):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the switch."""
         if self._outlet is not None:
-            if hasattr(self._wattbox, "async_send_master_command"):
-                await self._wattbox.async_send_master_command(Commands.OFF)
+            async_send_master_command = getattr(
+                self._wattbox, "async_send_master_command", None
+            )
+            if callable(async_send_master_command):
+                await self._async_run_outlet_command(
+                    False, lambda: async_send_master_command(Commands.OFF)
+                )
             else:
                 await super().async_turn_off(**kwargs)
