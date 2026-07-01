@@ -230,10 +230,6 @@ def _wrap_http_method(wattbox: BaseWattBox, method_name: str) -> None:
             return await _async_retry_with_fresh_http_client(
                 wattbox, method, method_name, args, kwargs, error
             )
-        except httpx.TransportError as error:
-            return await _async_retry_with_fresh_http_client(
-                wattbox, method, method_name, args, kwargs, error
-            )
 
     setattr(wattbox, method_name, wrapped)
 

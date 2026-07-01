@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from httpx import HTTPStatusError
+from httpx import HTTPStatusError, TransportError
 from pywattbox.base import BaseWattBox, Commands, Outlet
 
 from .const import CONF_NAME_REGEXP, CONF_SKIP_REGEXP, DOMAIN_DATA, PLUG_ICON
@@ -209,6 +209,19 @@ class WattBoxBinarySwitch(WattBoxEntity, SwitchEntity):
                     self._wattbox,
                     self._outlet.index,
                     desired_state,
+                )
+                return
+            raise
+        except TransportError as err:
+            await self._async_refresh_from_wattbox()
+            if self._outlet.status is desired_state:
+                _LOGGER.warning(
+                    "WattBox command response failed for %s outlet %s, "
+                    "but the outlet reached %s: %s",
+                    self._wattbox,
+                    self._outlet.index,
+                    desired_state,
+                    err,
                 )
                 return
             raise
