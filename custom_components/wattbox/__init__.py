@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Final, cast
 
+import aiohttp
 import homeassistant.helpers.config_validation as cv
 import httpx
 import voluptuous as vol
@@ -28,6 +29,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers import discovery
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.importlib import async_import_module
@@ -115,7 +117,7 @@ async def _async_create_wattbox(
         wattbox = await async_create_http_wattbox(
             host=host, user=username, password=password, port=port
         )
-        await _async_setup_http_client_recovery(wattbox)
+        await _async_setup_http_client_recovery(hass, wattbox)
 
     return wattbox
 
@@ -129,12 +131,15 @@ def _new_http_client() -> httpx.AsyncClient:
     )
 
 
-async def _async_setup_http_client_recovery(wattbox: BaseWattBox) -> None:
+async def _async_setup_http_client_recovery(
+    hass: HomeAssistant, wattbox: BaseWattBox
+) -> None:
     """Wrap pywattbox HTTP calls with stale-client recovery."""
     if not hasattr(wattbox, "async_client"):
         return
 
     wattbox_http = cast(Any, wattbox)
+    wattbox_http._ha_aiohttp_session = async_get_clientsession(hass)
     old_client = getattr(wattbox, "async_client", None)
     wattbox_http.async_client = _new_http_client()
     wattbox_http._ha_http_client_created_at = datetime.now()
@@ -143,15 +148,70 @@ async def _async_setup_http_client_recovery(wattbox: BaseWattBox) -> None:
     if getattr(wattbox, "_ha_http_client_recovery_wrapped", False):
         return
 
-    for method_name in (
-        "async_get_initial",
-        "async_update",
-        "async_send_command",
-        "async_send_master_command",
-    ):
+    _wrap_http_update_methods(wattbox)
+
+    for method_name in ("async_send_command", "async_send_master_command"):
         _wrap_http_method(wattbox, method_name)
 
     wattbox_http._ha_http_client_recovery_wrapped = True
+
+
+def _wrap_http_update_methods(wattbox: BaseWattBox) -> None:
+    """Use tolerant XML reads for WattBox status updates."""
+    wattbox_http = cast(Any, wattbox)
+
+    async def async_get_initial() -> None:
+        response = await _async_get_wattbox_info_response(wattbox)
+        wattbox_http.parse_initial(response)
+        wattbox_http.parse_update(response)
+
+    async def async_update() -> None:
+        response = await _async_get_wattbox_info_response(wattbox)
+        wattbox_http.parse_update(response)
+
+    wattbox_http.async_get_initial = async_get_initial
+    wattbox_http.async_update = async_update
+
+
+async def _async_get_wattbox_info_response(wattbox: BaseWattBox) -> httpx.Response:
+    """Fetch wattbox_info.xml while tolerating early connection closes."""
+    wattbox_http = cast(Any, wattbox)
+    session = wattbox_http._ha_aiohttp_session
+    url = f"{wattbox_http.base_host}/wattbox_info.xml"
+    chunks: list[bytes] = []
+    status = 0
+
+    try:
+        async with session.get(
+            url,
+            auth=aiohttp.BasicAuth(wattbox.user, wattbox.password),
+            headers=HTTP_CLIENT_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as response:
+            status = response.status
+            try:
+                async for chunk in response.content.iter_any():
+                    chunks.append(chunk)
+            except aiohttp.ClientPayloadError as error:
+                if not chunks:
+                    raise
+                _LOGGER.debug(
+                    "Using partial WattBox XML response from %s after early close: %s",
+                    wattbox,
+                    error,
+                )
+    except aiohttp.ClientError as error:
+        raise httpx.TransportError(str(error)) from error
+    except TimeoutError as error:
+        raise httpx.TimeoutException(str(error)) from error
+
+    http_response = httpx.Response(
+        status_code=status,
+        content=b"".join(chunks),
+        request=httpx.Request("GET", url),
+    )
+    http_response.raise_for_status()
+    return http_response
 
 
 def _wrap_http_method(wattbox: BaseWattBox, method_name: str) -> None:
