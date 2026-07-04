@@ -204,7 +204,7 @@ class WattBoxBinarySwitch(WattBoxEntity, SwitchEntity):
 
             await self._async_refresh_from_wattbox()
             if self._outlet.status is desired_state:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "WattBox returned HTTP 400 for %s, but outlet %s reached %s",
                     self._wattbox,
                     self._outlet.index,
@@ -215,7 +215,7 @@ class WattBoxBinarySwitch(WattBoxEntity, SwitchEntity):
         except TransportError as err:
             await self._async_refresh_from_wattbox()
             if self._outlet.status is desired_state:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "WattBox command response failed for %s outlet %s, "
                     "but the outlet reached %s: %s",
                     self._wattbox,
