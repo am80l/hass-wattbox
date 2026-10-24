@@ -14,6 +14,18 @@
 
 Easiest way to install this component is through [HACS][hacs].
 
+## Command Confirmation
+
+An outlet can take a moment to report its new state after accepting a command.
+The integration sends the command once, waits one second, then checks status
+every two seconds for up to 15 seconds. Individual and master switches only
+report success after a fresh status response confirms the requested state.
+Temporary read failures are retried within that window; commands are not resent.
+If confirmation times out, check the outlet before issuing another command.
+
+Regression tests run with `python -m unittest discover -s tests -v` using Home
+Assistant 2026.10.2 and pywattbox 0.9.0.
+
 ## Configuration
 
 ### UI Configuration (Recommended)

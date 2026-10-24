@@ -1,5 +1,6 @@
 """Switch platform for wattbox."""
 
+import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -19,6 +20,9 @@ from .const import CONF_NAME_REGEXP, CONF_SKIP_REGEXP, DOMAIN_DATA, PLUG_ICON
 from .entity import WattBoxEntity
 
 _LOGGER = logging.getLogger(__name__)
+COMMAND_VERIFY_TIMEOUT = 15
+COMMAND_SETTLE_DELAY = 1
+COMMAND_POLL_INTERVAL = 2
 
 
 def validate_regex(config: ConfigType, key: str) -> re.Pattern[str] | None:
@@ -196,41 +200,65 @@ class WattBoxBinarySwitch(WattBoxEntity, SwitchEntity):
         self, desired_state: bool, command: Callable[[], Awaitable[None]]
     ) -> None:
         """Run an outlet command and verify state from the WattBox afterward."""
+        command_error: Exception | None = None
         try:
             await command()
         except HTTPStatusError as err:
             if err.response.status_code != 400:
                 raise
-
-            await self._async_refresh_from_wattbox()
-            if self._outlet.status is desired_state:
-                _LOGGER.debug(
-                    "WattBox returned HTTP 400 for %s, but outlet %s reached %s",
-                    self._wattbox,
-                    self._outlet.index,
-                    desired_state,
-                )
-                return
-            raise
+            command_error = err
         except TransportError as err:
-            await self._async_refresh_from_wattbox()
-            if self._outlet.status is desired_state:
-                _LOGGER.debug(
-                    "WattBox command response failed for %s outlet %s, "
-                    "but the outlet reached %s: %s",
-                    self._wattbox,
-                    self._outlet.index,
-                    desired_state,
-                    err,
-                )
-                return
+            command_error = err
+
+        try:
+            await self._async_wait_for_outlets([self._outlet], desired_state)
+        except HomeAssistantError as err:
+            if command_error is not None:
+                raise err from command_error
             raise
 
-        await self._async_refresh_from_wattbox()
-        if self._outlet.status is not desired_state:
-            raise HomeAssistantError(
-                f"WattBox outlet {self._outlet.index} did not reach {desired_state}"
+        if command_error is not None:
+            _LOGGER.debug(
+                "WattBox command response failed for %s outlet %s, "
+                "but the outlet reached %s: %s",
+                self._wattbox,
+                self._outlet.index,
+                desired_state,
+                command_error,
             )
+
+    async def _async_wait_for_outlets(
+        self, outlets: list[Outlet], desired_state: bool
+    ) -> None:
+        """Allow delayed status updates, polling without resending commands."""
+        if not outlets:
+            return
+
+        last_error: Exception | None = None
+        try:
+            async with asyncio.timeout(COMMAND_VERIFY_TIMEOUT):
+                await asyncio.sleep(COMMAND_SETTLE_DELAY)
+                while True:
+                    try:
+                        await self._async_refresh_from_wattbox()
+                    except HTTPStatusError as err:
+                        if err.response.status_code != 400:
+                            raise
+                        last_error = err
+                    except (TransportError, TimeoutError) as err:
+                        last_error = err
+                    else:
+                        last_error = None
+                        if all(outlet.status is desired_state for outlet in outlets):
+                            return
+                    await asyncio.sleep(COMMAND_POLL_INTERVAL)
+        except TimeoutError:
+            state = "on" if desired_state else "off"
+            indices = [outlet.index for outlet in outlets]
+            raise HomeAssistantError(
+                f"WattBox could not confirm outlets {indices} {state} "
+                f"within {COMMAND_VERIFY_TIMEOUT} seconds"
+            ) from last_error
 
     async def _async_refresh_from_wattbox(self) -> None:
         """Refresh WattBox data and publish the current outlet state."""
@@ -288,19 +316,9 @@ class WattBoxMasterSwitch(WattBoxBinarySwitch):
             except TransportError as err:
                 last_error = err
 
-        await self._wattbox.async_update()
-        await self.async_update()
-        self.async_write_ha_state()
-
-        failed_outlets = [
-            outlet.index
-            for outlet in master_outlets
-            if outlet.status is not desired_state
-        ]
-        if failed_outlets:
-            error = HomeAssistantError(
-                f"WattBox master command did not reach outlets {failed_outlets}"
-            )
+        try:
+            await self._async_wait_for_outlets(master_outlets, desired_state)
+        except HomeAssistantError as err:
             if last_error is not None:
-                raise error from last_error
-            raise error
+                raise err from last_error
+            raise
