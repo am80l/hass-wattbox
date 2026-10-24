@@ -7,8 +7,7 @@ https://github.com/eseglem/hass-wattbox/
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import partial
 from typing import Any, Final, cast
 
@@ -34,7 +33,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.importlib import async_import_module
 from homeassistant.helpers.typing import ConfigType
-from pywattbox.base import BaseWattBox
+from pywattbox.base import BaseWattBox, Commands
 
 from .const import (
     BINARY_SENSOR_TYPES,
@@ -58,7 +57,6 @@ REQUIREMENTS: Final[list[str]] = ["pywattbox>=0.7.2"]
 _LOGGER = logging.getLogger(__name__)
 
 ALL_SENSOR_TYPES: Final[list[str]] = [*BINARY_SENSOR_TYPES.keys(), *SENSOR_TYPES.keys()]
-HTTP_CLIENT_MAX_AGE: Final[timedelta] = timedelta(hours=1)
 HTTP_CLIENT_HEADERS: Final[dict[str, str]] = {
     "Connection": "close",
     "User-Agent": "HA",
@@ -122,15 +120,6 @@ async def _async_create_wattbox(
     return wattbox
 
 
-def _new_http_client() -> httpx.AsyncClient:
-    """Create an HTTP client that avoids stale WattBox keep-alive state."""
-    return httpx.AsyncClient(
-        verify=False,
-        headers=HTTP_CLIENT_HEADERS,
-        limits=httpx.Limits(max_keepalive_connections=0),
-    )
-
-
 async def _async_setup_http_client_recovery(
     hass: HomeAssistant, wattbox: BaseWattBox
 ) -> None:
@@ -141,17 +130,13 @@ async def _async_setup_http_client_recovery(
     wattbox_http = cast(Any, wattbox)
     wattbox_http._ha_aiohttp_session = async_get_clientsession(hass)
     old_client = getattr(wattbox, "async_client", None)
-    wattbox_http.async_client = _new_http_client()
-    wattbox_http._ha_http_client_created_at = datetime.now()
     await _async_close_http_client(old_client)
 
     if getattr(wattbox, "_ha_http_client_recovery_wrapped", False):
         return
 
     _wrap_http_update_methods(wattbox)
-
-    for method_name in ("async_send_command", "async_send_master_command"):
-        _wrap_http_method(wattbox, method_name)
+    _wrap_http_command_methods(wattbox)
 
     wattbox_http._ha_http_client_recovery_wrapped = True
 
@@ -214,65 +199,64 @@ async def _async_get_wattbox_info_response(wattbox: BaseWattBox) -> httpx.Respon
     return http_response
 
 
-def _wrap_http_method(wattbox: BaseWattBox, method_name: str) -> None:
-    """Retry pywattbox HTTP methods once with a fresh client."""
-    method = getattr(wattbox, method_name, None)
-    if not callable(method):
+def _wrap_http_command_methods(wattbox: BaseWattBox) -> None:
+    """Send commands once while tolerating broken WattBox response bodies."""
+    wattbox_http = cast(Any, wattbox)
+
+    async def async_send_command(outlet: int, command: Commands) -> None:
+        await _async_send_wattbox_command(wattbox, outlet, command)
+
+    async def async_send_master_command(command: Commands) -> None:
+        if command not in (Commands.ON, Commands.OFF):
+            raise ValueError(
+                f"Command ({command}) can only be `Commands.ON` or `Commands.OFF`."
+            )
+        desired_state = command == Commands.ON
+        for outlet in wattbox.outlets.values():
+            if outlet.method and outlet.status is not desired_state:
+                await async_send_command(outlet.index, command)
+
+    wattbox_http.async_send_command = async_send_command
+    wattbox_http.async_send_master_command = async_send_master_command
+
+
+async def _async_send_wattbox_command(
+    wattbox: BaseWattBox, outlet: int, command: Commands
+) -> None:
+    """Send one HTTP command without requiring a complete response body."""
+    wattbox_http = cast(Any, wattbox)
+    session = wattbox_http._ha_aiohttp_session
+    url = f"{wattbox_http.base_host}/control.cgi"
+    params = {"outlet": outlet, "command": command.value}
+    status = 0
+
+    try:
+        async with session.get(
+            url,
+            params=params,
+            auth=aiohttp.BasicAuth(wattbox.user, wattbox.password),
+            headers=HTTP_CLIENT_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as response:
+            status = response.status
+    except aiohttp.ClientError as error:
+        raise httpx.TransportError(str(error)) from error
+    except TimeoutError as error:
+        raise httpx.TimeoutException(str(error)) from error
+
+    if status == 400:
+        _LOGGER.debug(
+            "WattBox returned HTTP 400 after accepting outlet %s command %s",
+            outlet,
+            command.name,
+        )
         return
 
-    async def wrapped(*args: Any, **kwargs: Any) -> Any:
-        await _async_refresh_http_client_if_needed(wattbox)
-        try:
-            return await method(*args, **kwargs)
-        except httpx.HTTPStatusError as error:
-            if error.response.status_code != 400:
-                raise
-            return await _async_retry_with_fresh_http_client(
-                wattbox, method, method_name, args, kwargs, error
-            )
-
-    setattr(wattbox, method_name, wrapped)
-
-
-async def _async_retry_with_fresh_http_client(
-    wattbox: BaseWattBox,
-    method: Callable[..., Awaitable[Any]],
-    method_name: str,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    error: Exception,
-) -> Any:
-    """Replace the HTTP client and retry a failed pywattbox request once."""
-    _LOGGER.warning(
-        "Refreshing stale WattBox HTTP client for %s after %s failed: %s",
-        wattbox,
-        method_name,
-        error,
+    http_response = httpx.Response(
+        status_code=status,
+        request=httpx.Request("GET", url, params=params),
     )
-    await _async_replace_http_client(wattbox)
-    return await method(*args, **kwargs)
-
-
-async def _async_refresh_http_client_if_needed(wattbox: BaseWattBox) -> None:
-    """Recreate the HTTP client before it can become long-lived and stale."""
-    async_client = getattr(wattbox, "async_client", None)
-    created_at = getattr(wattbox, "_ha_http_client_created_at", None)
-    if (
-        async_client is None
-        or getattr(async_client, "is_closed", False)
-        or not isinstance(created_at, datetime)
-        or datetime.now() - created_at > HTTP_CLIENT_MAX_AGE
-    ):
-        await _async_replace_http_client(wattbox)
-
-
-async def _async_replace_http_client(wattbox: BaseWattBox) -> None:
-    """Replace and close the pywattbox HTTP client."""
-    wattbox_http = cast(Any, wattbox)
-    old_client = getattr(wattbox, "async_client", None)
-    wattbox_http.async_client = _new_http_client()
-    wattbox_http._ha_http_client_created_at = datetime.now()
-    await _async_close_http_client(old_client)
+    http_response.raise_for_status()
 
 
 async def _async_close_http_client(async_client: Any) -> None:

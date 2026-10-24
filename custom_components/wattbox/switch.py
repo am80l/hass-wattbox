@@ -9,7 +9,7 @@ from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
+from homeassistant.exceptions import HomeAssistantError, PlatformNotReady
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from httpx import HTTPStatusError, TransportError
@@ -227,6 +227,10 @@ class WattBoxBinarySwitch(WattBoxEntity, SwitchEntity):
             raise
 
         await self._async_refresh_from_wattbox()
+        if self._outlet.status is not desired_state:
+            raise HomeAssistantError(
+                f"WattBox outlet {self._outlet.index} did not reach {desired_state}"
+            )
 
     async def _async_refresh_from_wattbox(self) -> None:
         """Refresh WattBox data and publish the current outlet state."""
@@ -249,23 +253,54 @@ class WattBoxMasterSwitch(WattBoxBinarySwitch):
     async def async_update(self) -> None:
         """Update the sensor."""
         if self._outlet is not None:
-            # Check the data and update the value.
-            self._attr_is_on = self._outlet.status
+            master_outlets = [
+                outlet for outlet in self._wattbox.outlets.values() if outlet.method
+            ]
+            self._attr_is_on = any(outlet.status for outlet in master_outlets)
 
-    async def async_turn_on(self, **kwargs: Any) -> None:
+    async def async_turn_on(self, **_kwargs: Any) -> None:
         """Turn on the switch."""
         if self._outlet is not None:
-            await super().async_turn_on(**kwargs)
+            await self._async_run_master_command(True)
 
-    async def async_turn_off(self, **kwargs: Any) -> None:
+    async def async_turn_off(self, **_kwargs: Any) -> None:
         """Turn off the switch."""
         if self._outlet is not None:
-            async_send_master_command = getattr(
-                self._wattbox, "async_send_master_command", None
+            await self._async_run_master_command(False)
+
+    async def _async_run_master_command(self, desired_state: bool) -> None:
+        """Command every master-managed outlet despite broken HTTP responses."""
+        command = Commands.ON if desired_state else Commands.OFF
+        master_outlets = [
+            outlet for outlet in self._wattbox.outlets.values() if outlet.method
+        ]
+        last_error: Exception | None = None
+
+        for outlet in master_outlets:
+            if outlet.status is desired_state:
+                continue
+            try:
+                await self._wattbox.async_send_command(outlet.index, command)
+            except HTTPStatusError as err:
+                if err.response.status_code != 400:
+                    raise
+                last_error = err
+            except TransportError as err:
+                last_error = err
+
+        await self._wattbox.async_update()
+        await self.async_update()
+        self.async_write_ha_state()
+
+        failed_outlets = [
+            outlet.index
+            for outlet in master_outlets
+            if outlet.status is not desired_state
+        ]
+        if failed_outlets:
+            error = HomeAssistantError(
+                f"WattBox master command did not reach outlets {failed_outlets}"
             )
-            if callable(async_send_master_command):
-                await self._async_run_outlet_command(
-                    False, lambda: async_send_master_command(Commands.OFF)
-                )
-            else:
-                await super().async_turn_off(**kwargs)
+            if last_error is not None:
+                raise error from last_error
+            raise error
