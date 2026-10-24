@@ -152,7 +152,7 @@ class WattBoxIntegrationSensor(IntegrationSensor):
             max_sub_interval = timedelta(minutes=5)
 
         # Initialize IntegrationSensor with all required parameters
-        super().__init__(
+        super().__init__(  # type: ignore[call-arg]
             integration_method=integration_method,
             name=sensor_name,
             round_digits=round_digits,
