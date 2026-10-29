@@ -28,6 +28,15 @@ Assistant 2026.10.2 and pywattbox 0.9.0.
 
 ## Configuration
 
+### Startup Recovery
+
+Each YAML-configured WattBox connects independently in the background. A device
+that is slow or offline retries every 30 seconds without preventing other
+WattBoxes from loading. UI-configured devices use Home Assistant's setup retries.
+The initial HTTP status read uses the same tolerant transport as later updates,
+including handling devices that omit the end of a chunked response. Startup and
+retries only read status; they never change outlet power.
+
 ### UI Configuration (Recommended)
 
 Starting with version 1.0.0, this integration supports UI-based configuration through the Home Assistant interface:

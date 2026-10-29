@@ -26,7 +26,7 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import discovery
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -61,6 +61,7 @@ HTTP_CLIENT_HEADERS: Final[dict[str, str]] = {
     "Connection": "close",
     "User-Agent": "HA",
 }
+SETUP_RETRY_DELAY: Final[int] = 30
 
 WATTBOX_HOST_SCHEMA = vol.Schema(
     {
@@ -106,16 +107,18 @@ async def _async_create_wattbox(
         )
     else:
         _LOGGER.debug("Importing HTTP Wattbox")
-        from pywattbox.http_wattbox import async_create_http_wattbox
+        from pywattbox.http_wattbox import HttpWattBox
 
         # Pre-import the encoding to avoid blocking call issues
         await async_import_module(hass, "encodings.ascii")
 
         _LOGGER.debug("Creating HTTP WattBox")
-        wattbox = await async_create_http_wattbox(
-            host=host, user=username, password=password, port=port
-        )
+        # The library factory performs HTTP reads before we can wrap its client.
+        wattbox = HttpWattBox(host=host, user=username, password=password, port=port)
         await _async_setup_http_client_recovery(hass, wattbox)
+        await wattbox.async_get_initial()
+        if not wattbox.outlets:
+            raise ValueError("WattBox initial response contained no outlets")
 
     return wattbox
 
@@ -123,7 +126,7 @@ async def _async_create_wattbox(
 async def _async_setup_http_client_recovery(
     hass: HomeAssistant, wattbox: BaseWattBox
 ) -> None:
-    """Wrap pywattbox HTTP calls with stale-client recovery."""
+    """Use HA's HTTP session before any pywattbox network requests."""
     if not hasattr(wattbox, "async_client"):
         return
 
@@ -273,7 +276,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up this component."""
     _LOGGER.info(STARTUP)
 
-    hass.data[DOMAIN_DATA] = {}
+    hass.data.setdefault(DOMAIN_DATA, {})
 
     # Only process YAML config if it exists
     domain_config = config.get(DOMAIN, [])
@@ -285,47 +288,54 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         _LOGGER.debug("No YAML configuration found, will rely on config entries")
 
     for wattbox_host in domain_config:
-        _LOGGER.debug(repr(wattbox_host))
-        # Create DATA dict
-        host = wattbox_host.get(CONF_HOST)
-        password = wattbox_host.get(CONF_PASSWORD)
-        port = wattbox_host.get(CONF_PORT)
-        username = wattbox_host.get(CONF_USERNAME)
-        name = wattbox_host.get(CONF_NAME)
-
-        wattbox: BaseWattBox
-        try:
-            wattbox = await _async_create_wattbox(hass, host, port, username, password)
-        except Exception as error:
-            _LOGGER.error("Error creating WattBox instance: %s", error)
-            raise PlatformNotReady from error
-
-        hass.data[DOMAIN_DATA][name] = wattbox
-
-        # Load platforms
-        for platform in PLATFORMS:
-            # Get platform specific configuration
-            hass.async_create_task(
-                discovery.async_load_platform(
-                    hass, platform, DOMAIN, wattbox_host, config
-                )
-            )
-
-        # Use the scan interval to trigger updates
-        scan_interval = wattbox_host.get(CONF_SCAN_INTERVAL)
-        async_track_time_interval(
-            hass, partial(update_data, hass=hass, name=name), scan_interval
+        # HA cancels background tasks at shutdown; retries must not block startup.
+        hass.async_create_background_task(
+            _async_setup_yaml_wattbox(hass, wattbox_host, config),
+            f"WattBox setup: {wattbox_host[CONF_NAME]}",
         )
 
-    # Extra logging to ensure the right outlets are set up.
-    _LOGGER.debug(", ".join([str(v) for _, v in hass.data[DOMAIN_DATA].items()]))
-    _LOGGER.debug(repr(hass.data[DOMAIN_DATA]))
-    for _, wattbox in hass.data[DOMAIN_DATA].items():
-        _LOGGER.debug("%s has %s outlets", wattbox, len(wattbox.outlets))
-        for outlet in wattbox.outlets:
-            _LOGGER.debug("Outlet: %s - %s", outlet, repr(outlet))
-
     return True
+
+
+async def _async_setup_yaml_wattbox(
+    hass: HomeAssistant, wattbox_host: ConfigType, config: ConfigType
+) -> None:
+    """Connect one YAML device independently, retrying until it is ready."""
+    name = wattbox_host[CONF_NAME]
+    while True:
+        wattbox: BaseWattBox
+        try:
+            wattbox = await _async_create_wattbox(
+                hass,
+                wattbox_host[CONF_HOST],
+                wattbox_host[CONF_PORT],
+                wattbox_host[CONF_USERNAME],
+                wattbox_host[CONF_PASSWORD],
+            )
+        except Exception as error:
+            _LOGGER.warning(
+                "WattBox %s is not ready (%r); retrying in %s seconds",
+                name,
+                error,
+                SETUP_RETRY_DELAY,
+            )
+            await asyncio.sleep(SETUP_RETRY_DELAY)
+            continue
+        break
+
+    hass.data[DOMAIN_DATA][name] = wattbox
+
+    for platform in PLATFORMS:
+        hass.async_create_task(
+            discovery.async_load_platform(hass, platform, DOMAIN, wattbox_host, config)
+        )
+
+    async_track_time_interval(
+        hass,
+        partial(update_data, hass=hass, name=name),
+        wattbox_host[CONF_SCAN_INTERVAL],
+    )
+    _LOGGER.info("WattBox %s connected with %s outlets", name, len(wattbox.outlets))
 
 
 async def update_data(_dt: datetime, hass: HomeAssistant, name: str) -> None:
@@ -361,8 +371,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         wattbox = await _async_create_wattbox(hass, host, port, username, password)
     except Exception as error:
-        _LOGGER.error("Error creating WattBox instance: %s", error)
-        raise PlatformNotReady from error
+        raise ConfigEntryNotReady(
+            f"Could not connect to WattBox {name}: {error!r}"
+        ) from error
 
     hass.data[DOMAIN_DATA][name] = wattbox
 
