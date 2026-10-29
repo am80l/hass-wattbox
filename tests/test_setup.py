@@ -129,8 +129,8 @@ class HttpStartupTests(unittest.IsolatedAsyncioTestCase):
         async def handle(reader, writer):
             requests.append(await reader.readuntil(b"\r\n\r\n"))
             writer.write(
-                f"HTTP/1.1 {status} Test\r\nTransfer-Encoding: chunked\r\n"
-                "Connection: close\r\n\r\n".encode()
+                f"HTTP/1.1 {status} Test\r\n".encode()
+                + b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
                 + f"{len(payload):x}\r\n".encode()
                 + payload
                 + b"\r\n"
