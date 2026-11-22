@@ -64,7 +64,6 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict:
             "name": name,
             "serial_number": wattbox.serial_number,
         }
-        _LOGGER.debug("generated config data: %s", config)
         return config
     except Exception as exc:
         _LOGGER.error("Error connecting to WattBox %s: %s", host, exc)
